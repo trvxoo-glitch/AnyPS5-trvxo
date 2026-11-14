@@ -8009,6 +8009,10 @@ void SetDeviceLocalFullForTests(bool full) {
     deviceLocalFullForTests.store(full, std::memory_order_relaxed);
 }
 
+bool DeviceLocalFullForTests() {
+    return deviceLocalFullForTests.load(std::memory_order_relaxed);
+}
+
 std::uint64_t StagingShadowsRefused() {
     return Copies().stagingRefused.load(std::memory_order_relaxed);
 }
