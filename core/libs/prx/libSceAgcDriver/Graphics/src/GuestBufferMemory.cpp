@@ -6087,7 +6087,7 @@ std::uint64_t gpuCopyLimit() {
 
 bool changedCopyBacks(const Context& context) {
     static const bool disabled = std::getenv("APS5_NO_CHANGED_COPY_BACK") != nullptr;
-    return !disabled && context.bufferDeviceAddress;
+    return !disabled && context.changedCopyBacks && context.bufferDeviceAddress;
 }
 
 VkBufferUsageFlags gpuCopyUsage(const Context& context, bool addressable) {
