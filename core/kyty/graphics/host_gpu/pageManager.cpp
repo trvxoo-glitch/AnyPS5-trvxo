@@ -56,6 +56,7 @@ constexpr uint64_t READ_GRANULE_PAGES = READ_GRANULE_SIZE / PAGE_SIZE;
 }
 
 using SpinGuard = std::lock_guard<TrackingSpinLock>;
+namespace RegCeil = Libs::LibKernel::Memory::RegCeil;
 
 thread_local std::vector<PageManager::DeferredRange>* g_deferred_write_protect = nullptr;
 
@@ -122,6 +123,7 @@ struct PageManager::Impl {
 		TrackingSpinLock                    lock;
 		std::array<PageState, REGION_PAGES> pages;
 		std::array<std::atomic<uint8_t>, REGION_PAGES> read_hint {};
+		std::array<uint8_t, REGION_PAGES>   host {};
 	};
 
 	Impl() {
@@ -143,9 +145,13 @@ struct PageManager::Impl {
 		}
 #endif
 		regions = std::make_unique<std::atomic<Region*>[]>(REGION_COUNT);
+		if (RegCeil::SkipConfigured()) {
+			RegCeil::SetRearmRestore([](void* self) { static_cast<Impl*>(self)->RestoreAll(); }, this);
+		}
 	}
 
 	~Impl() {
+		RegCeil::SetRearmRestore(nullptr, this);
 		for (const auto& region: region_storage) {
 			SpinGuard lock(region->lock);
 			for (auto& page: region->pages) {
@@ -172,6 +178,7 @@ struct PageManager::Impl {
 		auto  region = std::make_unique<Region>();
 		auto* ptr    = region.get();
 		region_storage.push_back(std::move(region));
+		region_bases.push_back(index * REGION_SIZE);
 		regions[index].store(ptr, std::memory_order_release);
 		return ptr;
 	}
@@ -183,9 +190,64 @@ struct PageManager::Impl {
 		}
 	}
 
+	static uint8_t HostState(Common::VirtualMemory::Mode mode) noexcept {
+		return static_cast<uint8_t>(static_cast<uint32_t>(mode) + 1u);
+	}
+
+	[[nodiscard]] static bool AlreadyProtected(const Region& region, size_t first, size_t count,
+	                                           Common::VirtualMemory::Mode mode) noexcept {
+		const auto state = HostState(mode);
+		for (size_t page = first; page < first + count; page++) {
+			if (region.host[page] != state) return false;
+		}
+		return true;
+	}
+
+	[[nodiscard]] static bool SkipRearm(const Region& region, size_t first, size_t count,
+	                                    Common::VirtualMemory::Mode mode) noexcept {
+		const int lever = RegCeil::RearmLever();
+		if (lever == RegCeil::LeverExact) return false;
+		if (lever == RegCeil::LeverProtected && !AlreadyProtected(region, first, count, mode)) return false;
+		RegCeil::NoteProtect(RegCeil::FnRearm, count * PAGE_SIZE, true, 0);
+		return true;
+	}
+
+	template <bool track, bool is_read>
+	static int ProtectKind(bool tracker) noexcept {
+		if constexpr (is_read) {
+			return track ? RegCeil::FnReadWatch : RegCeil::FnReadUnwatch;
+		} else if constexpr (track) {
+			return tracker ? RegCeil::FnRearm : RegCeil::FnOtherProtect;
+		} else {
+			return tracker ? RegCeil::FnWriteUnwatch : RegCeil::FnOtherProtect;
+		}
+	}
+
+	void ProtectRegion(Region& region, uint64_t region_base, uint64_t vaddr, uint64_t size,
+	                   Common::VirtualMemory::Mode mode, int kind) noexcept {
+		if (!RegCeil::Enabled()) {
+			Protect(vaddr, size, mode);
+			return;
+		}
+		const auto first = static_cast<size_t>((vaddr - region_base) / PAGE_SIZE);
+		const auto count = static_cast<size_t>(size / PAGE_SIZE);
+		if (kind == RegCeil::FnRearm && SkipRearm(region, first, count, mode)) return;
+		const auto start = RegCeil::Begin();
+		Protect(vaddr, size, mode);
+		RegCeil::NoteProtect(kind, size, false, RegCeil::Begin() - start);
+		std::fill_n(region.host.begin() + first, count, HostState(mode));
+	}
+
+	void RestoreAll() {
+		std::lock_guard lock(region_mutex);
+		for (const auto base: region_bases) {
+			ReapplyProtection(base, REGION_SIZE, true);
+		}
+	}
+
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
-	                          const RegionBits* mask = nullptr) {
+	                          const RegionBits* mask = nullptr, bool tracker = false) {
 		SpinGuard lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
@@ -194,10 +256,14 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				if (track && !is_read && g_deferred_write_protect != nullptr) {
+				const bool skipped = track && !is_read && tracker && RegCeil::Enabled() &&
+				                     SkipRearm(region, static_cast<size_t>(range_begin),
+				                               static_cast<size_t>(range_bytes / PAGE_SIZE), perms);
+				if (!skipped && track && !is_read && g_deferred_write_protect != nullptr) {
 					g_deferred_write_protect->push_back({base_addr + range_begin * PAGE_SIZE, range_bytes});
-				} else {
-					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				} else if (!skipped) {
+					ProtectRegion(region, base_addr, base_addr + range_begin * PAGE_SIZE, range_bytes, perms,
+					              ProtectKind<track, is_read>(tracker));
 				}
 				range_bytes           = 0;
 				potential_range_bytes = 0;
@@ -275,7 +341,7 @@ struct PageManager::Impl {
 		return false;
 	}
 
-	void ReapplyProtection(uint64_t vaddr, uint64_t size) {
+	void ReapplyProtection(uint64_t vaddr, uint64_t size, bool restore = false) {
 		ValidateRange(vaddr, size);
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
 		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
@@ -294,7 +360,11 @@ struct PageManager::Impl {
 					                                           region->pages[page_index].access_watchers != 0);
 					const auto perms   = watched ? region->pages[page_index].Perms() : run_perms;
 					if (in_run && (!watched || perms != run_perms)) {
-						Protect(region_base + run_begin * PAGE_SIZE, (page_index - run_begin) * PAGE_SIZE, run_perms);
+						if (!restore || !AlreadyProtected(*region, run_begin, page_index - run_begin, run_perms)) {
+							ProtectRegion(*region, region_base, region_base + run_begin * PAGE_SIZE,
+							              (page_index - run_begin) * PAGE_SIZE, run_perms,
+							              restore ? RegCeil::FnOtherProtect : RegCeil::FnRearm);
+						}
 						in_run = false;
 					}
 					if (watched && !in_run) {
@@ -309,7 +379,7 @@ struct PageManager::Impl {
 	}
 
 	template <bool track, bool is_read>
-	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
+	void UpdatePageWatchers(uint64_t vaddr, uint64_t size, bool tracker = false) {
 		ValidateRange(vaddr, size);
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
 		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
@@ -322,13 +392,14 @@ struct PageManager::Impl {
 			}
 			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
-			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last);
+			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last, nullptr, tracker);
 			chunk_begin = chunk_end;
 		}
 	}
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
+	std::vector<uint64_t>                   region_bases;
 	std::mutex                              region_mutex;
 };
 
@@ -429,7 +500,7 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	const auto last        = end_range.second;
 	if (start_range.second == end_range.second) {
 		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
-		                                           (last - first) * PAGE_SIZE);
+		                                           (last - first) * PAGE_SIZE, true);
 		return;
 	}
 
@@ -437,7 +508,7 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	if (region == nullptr) {
 		Fatal("untracking unknown region 0x%016" PRIx64, base_addr);
 	}
-	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
+	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask, true);
 }
 
 template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);

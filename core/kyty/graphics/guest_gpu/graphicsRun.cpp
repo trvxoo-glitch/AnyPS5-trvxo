@@ -647,6 +647,15 @@ void GuestGpu::ResolveThread() {
 			const auto* next = m_operations.TryPeek();
 			operation->stream_in_place = next != nullptr && !IsDrawOperation(next->kind);
 		}
+#if defined(ANYPS5_KYTY)
+		Libs::LibKernel::Memory::RegCeil::EndOp(
+		    operation->kind == GpuOperationKind::DrawIndex || operation->kind == GpuOperationKind::DrawAuto ||
+		            operation->kind == GpuOperationKind::DrawIndirect
+		        ? 1
+		    : operation->kind == GpuOperationKind::DispatchDirect || operation->kind == GpuOperationKind::DispatchIndirect
+		        ? 2
+		        : 0);
+#endif
 		m_resolved.Push(std::move(*operation));
 	}
 	helper.reset();

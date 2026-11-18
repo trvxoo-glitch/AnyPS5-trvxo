@@ -2,6 +2,9 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#if defined(ANYPS5_KYTY)
+#include "kernel/memory.h"
+#endif
 
 namespace Libs::Graphics {
 
@@ -67,6 +70,31 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
+#if defined(ANYPS5_KYTY)
+	namespace RegCeil = Libs::LibKernel::Memory::RegCeil;
+	if (RegCeil::Enabled()) {
+		RegCeil::Count(RegCeil::FnCpuModified);
+		if (RegCeil::On()) {
+			uint64_t memo = 0;
+			if (RegCeil::MemoLookup(RegCeil::FnCpuModified, vaddr, size, memo)) {
+				return memo != 0;
+			}
+			const bool result = Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+			});
+			RegCeil::MemoStore(RegCeil::FnCpuModified, vaddr, size, result ? 1 : 0);
+			return result;
+		}
+		if (RegCeil::Timing()) {
+			const auto start  = RegCeil::Begin();
+			const bool result = Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+			});
+			RegCeil::End(RegCeil::FnCpuModified, start);
+			return result;
+		}
+	}
+#endif
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
 	});

@@ -164,6 +164,41 @@ bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
                                        std::vector<std::pair<uint64_t, uint64_t>>& changes);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 [[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);
+
+namespace RegCeil {
+enum Fn : int {
+	FnIsBacked,
+	FnMappedPrefix,
+	FnIsFullyMapped,
+	FnClampRange,
+	FnStillValid,
+	FnMayFault,
+	FnCpuModified,
+	FnFindBacking,
+	FnRearm,
+	FnWriteUnwatch,
+	FnReadWatch,
+	FnReadUnwatch,
+	FnOtherProtect,
+	FnCount
+};
+enum Lever : int { LeverExact = 0, LeverMemo = 1, LeverProtected = 1, LeverSkip = 2 };
+[[nodiscard]] bool     Enabled() noexcept;
+[[nodiscard]] bool     Timing() noexcept;
+[[nodiscard]] bool     On() noexcept;
+[[nodiscard]] int      StillValidLever() noexcept;
+[[nodiscard]] int      RearmLever() noexcept;
+[[nodiscard]] bool     SkipConfigured() noexcept;
+[[nodiscard]] uint64_t Begin() noexcept;
+void                   End(int fn, uint64_t start) noexcept;
+void                   Count(int fn) noexcept;
+void                   NoteProtect(int fn, uint64_t bytes, bool skipped, uint64_t cycles) noexcept;
+void                   NoteFrame() noexcept;
+void                   SetRearmRestore(void (*restore)(void*), void* context) noexcept;
+void                   EndOp(int kind) noexcept;
+[[nodiscard]] bool     MemoLookup(int fn, uint64_t vaddr, uint64_t size, uint64_t& value) noexcept;
+void                   MemoStore(int fn, uint64_t vaddr, uint64_t size, uint64_t value) noexcept;
+}
 bool                   TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 bool                   TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
 bool                   TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size);

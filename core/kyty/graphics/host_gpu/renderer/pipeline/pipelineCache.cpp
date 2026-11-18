@@ -957,6 +957,39 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 }
 
 bool GuestReadLog::StillValid() const {
+#if defined(ANYPS5_KYTY)
+	namespace RegCeil = Libs::LibKernel::Memory::RegCeil;
+	if (RegCeil::Enabled()) {
+		const int lever = RegCeil::StillValidLever();
+		if (lever == RegCeil::LeverSkip) {
+			m_refresh.clear();
+			return !m_failed;
+		}
+		if (lever == RegCeil::LeverMemo) {
+			const auto key  = static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(this));
+			uint64_t   memo = 0;
+			if (RegCeil::MemoLookup(RegCeil::FnStillValid, key, m_entries.size(), memo)) {
+				m_refresh.clear();
+				return !m_failed;
+			}
+			const bool result = StillValidNow();
+			if (result) {
+				RegCeil::MemoStore(RegCeil::FnStillValid, key, m_entries.size(), 1);
+			}
+			return result;
+		}
+		if (RegCeil::Timing()) {
+			const auto start  = RegCeil::Begin();
+			const bool result = StillValidNow();
+			RegCeil::End(RegCeil::FnStillValid, start);
+			return result;
+		}
+	}
+#endif
+	return StillValidNow();
+}
+
+bool GuestReadLog::StillValidNow() const {
 	m_refresh.clear();
 	if (m_failed) {
 		return false;

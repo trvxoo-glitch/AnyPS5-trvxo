@@ -14,17 +14,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <exception>
 #include <mutex>
 #include <set>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <x86intrin.h>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -272,6 +276,171 @@ bool FirstClamp(uint64_t vaddr, uint64_t size, uint64_t clamped) {
 	static std::set<std::tuple<uint64_t, uint64_t, uint64_t>> reported;
 	std::lock_guard lock(mutex);
 	return reported.emplace(vaddr, size, clamped).second;
+}
+
+struct RegCeilConfig {
+	int      schedule   = 0;
+	bool     query      = false;
+	int      stillvalid = RegCeil::LeverExact;
+	int      rearm      = RegCeil::LeverExact;
+	uint64_t start_s    = 0;
+};
+
+[[noreturn]] void RegCeilBadValue(const char* name, const char* value, const char* allowed) {
+	std::fprintf(stderr, "[reg] %s=%s is not one of %s\n", name, value, allowed);
+	std::fflush(stderr);
+	std::abort();
+}
+
+const char* RegCeilEnv(const char* name) {
+	const char* value = std::getenv(name);
+	return value == nullptr || *value == 0 ? nullptr : value;
+}
+
+const RegCeilConfig& RegCfg() {
+	static const RegCeilConfig config = [] {
+		RegCeilConfig c;
+		if (const char* v = RegCeilEnv("KYTY_REG_CEIL")) {
+			const std::string_view text(v);
+			if (text == "0") {
+			} else if (text == "stats") {
+				c.schedule = 1;
+			} else if (text == "on" || text == "1" || text == "ab") {
+				c.schedule   = text == "ab" ? 3 : 2;
+				c.query      = true;
+				c.stillvalid = RegCeil::LeverSkip;
+			} else if (text == "all" || text == "all-ab") {
+				c.schedule   = text == "all-ab" ? 3 : 2;
+				c.query      = true;
+				c.stillvalid = RegCeil::LeverSkip;
+				c.rearm      = RegCeil::LeverSkip;
+			} else {
+				RegCeilBadValue("KYTY_REG_CEIL", v, "0, stats, on, ab, all, all-ab");
+			}
+		}
+		if (const char* v = RegCeilEnv("KYTY_STILLVALID_CEIL")) {
+			const std::string_view text(v);
+			if (text == "0") {
+				c.stillvalid = RegCeil::LeverExact;
+			} else if (text == "memo") {
+				c.stillvalid = RegCeil::LeverMemo;
+			} else if (text == "skip") {
+				c.stillvalid = RegCeil::LeverSkip;
+			} else {
+				RegCeilBadValue("KYTY_STILLVALID_CEIL", v, "0, memo, skip");
+			}
+		}
+		if (const char* v = RegCeilEnv("KYTY_REARM_CEIL")) {
+			const std::string_view text(v);
+			if (text == "0") {
+				c.rearm = RegCeil::LeverExact;
+			} else if (text == "protected") {
+				c.rearm = RegCeil::LeverProtected;
+			} else if (text == "skip") {
+				c.rearm = RegCeil::LeverSkip;
+			} else {
+				RegCeilBadValue("KYTY_REARM_CEIL", v, "0, protected, skip");
+			}
+		}
+		if (c.schedule == 0 && (c.stillvalid != RegCeil::LeverExact || c.rearm != RegCeil::LeverExact)) {
+			c.schedule = 2;
+		}
+		if (const char* v = RegCeilEnv("KYTY_CEIL_AB")) {
+			const std::string_view text(v);
+			if (text != "0" && text != "1") RegCeilBadValue("KYTY_CEIL_AB", v, "0, 1");
+			if (c.schedule >= 2) c.schedule = text == "1" ? 3 : 2;
+		}
+		if (const char* v = RegCeilEnv("KYTY_CEIL_START_S")) {
+			char* end     = nullptr;
+			const auto n  = std::strtoull(v, &end, 10);
+			if (end == v || *end != 0 || n > 3600) RegCeilBadValue("KYTY_CEIL_START_S", v, "0 to 3600");
+			c.start_s = n;
+		}
+		return c;
+	}();
+	return config;
+}
+
+int RegCeilMode() {
+	return RegCfg().schedule;
+}
+
+std::atomic<bool>     g_reg_on {false};
+std::atomic<uint64_t> g_reg_generation {1};
+std::atomic<uint64_t> g_reg_frames {0};
+uint64_t              g_reg_origin_ns = 0;
+
+struct RegCounters {
+	int      tid = 0;
+	uint64_t calls[RegCeil::FnCount] {};
+	uint64_t hits[RegCeil::FnCount] {};
+	uint64_t valid[RegCeil::FnCount] {};
+	uint64_t cycles[RegCeil::FnCount] {};
+};
+
+std::mutex                g_reg_threads_mutex;
+std::vector<RegCounters*> g_reg_threads;
+thread_local RegCounters* t_reg = nullptr;
+
+RegCounters& RegC() {
+	if (t_reg == nullptr) {
+		t_reg = new RegCounters;
+#ifndef _WIN32
+		t_reg->tid = static_cast<int>(::gettid());
+#endif
+		std::lock_guard lock(g_reg_threads_mutex);
+		g_reg_threads.push_back(t_reg);
+	}
+	return *t_reg;
+}
+
+struct RegMemoEntry {
+	uint64_t vaddr      = 0;
+	uint64_t size       = 0;
+	uint64_t result     = 0;
+	uint64_t backing    = 0;
+	uint64_t probe      = 0;
+	uint64_t generation = 0;
+	int      kind       = 0;
+};
+constexpr size_t           RegMemoSlots = 4096;
+thread_local RegMemoEntry* t_reg_memo   = nullptr;
+thread_local int           t_reg_depth  = 0;
+
+RegMemoEntry& RegMemoSlot(int kind, uint64_t vaddr, uint64_t size) {
+	if (t_reg_memo == nullptr) t_reg_memo = new RegMemoEntry[RegMemoSlots] {};
+	const auto hash = (vaddr * 0x9e3779b97f4a7c15ull) ^ (size * 0xc2b2ae3d27d4eb4full) ^ static_cast<uint64_t>(kind);
+	return t_reg_memo[(hash >> 32u) % RegMemoSlots];
+}
+
+template <typename Compute>
+uint64_t RegMemo(int kind, uint64_t vaddr, uint64_t size, Compute&& compute) {
+	const auto& cfg = RegCfg();
+	if (cfg.schedule == 0) return compute();
+	auto& c = RegC();
+	c.calls[kind]++;
+	if (cfg.schedule == 1) {
+		if (t_reg_depth != 0) return compute();
+		t_reg_depth++;
+		const auto start  = __rdtsc();
+		const auto result = compute();
+		c.cycles[kind] += __rdtsc() - start;
+		t_reg_depth--;
+		return result;
+	}
+	if (!cfg.query || !g_reg_on.load(std::memory_order_relaxed)) return compute();
+	auto&      entry      = RegMemoSlot(kind, vaddr, size);
+	const auto backing    = g_backing_epoch.load(std::memory_order_relaxed);
+	const auto probe      = g_probe_epoch.load(std::memory_order_relaxed);
+	const auto generation = g_reg_generation.load(std::memory_order_relaxed);
+	if (entry.kind == kind + 1 && entry.vaddr == vaddr && entry.size == size && entry.generation == generation) {
+		c.hits[kind]++;
+		if (entry.backing == backing && entry.probe == probe) c.valid[kind]++;
+		return entry.result;
+	}
+	const auto result = compute();
+	entry             = {vaddr, size, result, backing, probe, generation, kind + 1};
+	return result;
 }
 
 #ifndef _WIN32
@@ -561,7 +730,7 @@ void CopyGuestPages(uint64_t start, uint8_t* destination, uint64_t bytes) {
 	}
 }
 
-uint64_t MappedPrefix(uint64_t vaddr, uint64_t size) {
+uint64_t MappedPrefixNow(uint64_t vaddr, uint64_t size) {
 	const auto& pages = Pages();
 	const auto end = vaddr + size;
 	auto cursor = vaddr;
@@ -576,6 +745,10 @@ uint64_t MappedPrefix(uint64_t vaddr, uint64_t size) {
 		if (cursor < stop) break;
 	}
 	return cursor - vaddr;
+}
+
+uint64_t MappedPrefix(uint64_t vaddr, uint64_t size) {
+	return RegMemo(RegCeil::FnMappedPrefix, vaddr, size, [&] { return MappedPrefixNow(vaddr, size); });
 }
 
 int HostProtection(Common::VirtualMemory::Mode mode) {
@@ -717,13 +890,17 @@ bool ReleaseHostWrite(std::uintptr_t address, std::size_t bytes) {
 }
 #endif
 
-bool IsBacked(uint64_t vaddr, uint64_t size) {
+static bool IsBackedNow(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) return false;
 	const auto& pages = Pages();
 	for (auto page = vaddr >> PageBits; page <= (vaddr + size - 1u) >> PageBits; ++page) {
 		if (pages.LoadBacking(page) == 0) return false;
 	}
 	return true;
+}
+
+bool IsBacked(uint64_t vaddr, uint64_t size) {
+	return RegMemo(RegCeil::FnIsBacked, vaddr, size, [&] { return uint64_t {IsBackedNow(vaddr, size)}; }) != 0;
 }
 
 bool InGuestSpace(uint64_t vaddr, uint64_t size) {
@@ -808,7 +985,14 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return true;
 }
 
+static const void* FindBackingPointerNow(uint64_t vaddr, uint64_t size);
+
 const void* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+	return reinterpret_cast<const void*>(static_cast<std::uintptr_t>(
+	    RegMemo(RegCeil::FnFindBacking, vaddr, size, [&] { return static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(FindBackingPointerNow(vaddr, size))); })));
+}
+
+static const void* FindBackingPointerNow(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size) || !Shim::ViewEnabled()) return nullptr;
 	const uint8_t* result = nullptr;
 	bool split = false;
@@ -870,15 +1054,16 @@ bool BackingChangesSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_
 
 bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) return size == 0;
-	return Shim::IsBacked(vaddr, size) || MappedPrefix(vaddr, size) == size;
+	return RegMemo(RegCeil::FnIsFullyMapped, vaddr, size,
+	               [&] { return uint64_t {Shim::IsBacked(vaddr, size) || MappedPrefix(vaddr, size) == size}; }) != 0;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
-	if (IsFullyMapped(vaddr, size)) return size;
-	const auto clamped = MappedPrefix(vaddr, size);
+	const auto clamped = RegMemo(RegCeil::FnClampRange, vaddr, size, [&] { return IsFullyMapped(vaddr, size) ? size : MappedPrefix(vaddr, size); });
+	if (clamped == size) return size;
 	if (clamped == 0) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
@@ -1014,5 +1199,303 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+
+namespace RegCeil {
+
+namespace {
+
+struct Period {
+	bool     started     = false;
+	bool     on          = false;
+	int      execute_tid = 0;
+	int      record_tid  = 0;
+	uint64_t ops = 0, next_check = 0, draws = 0, disp = 0;
+	uint64_t wall = 0, cpu = 0, exec = 0, record = 0, tsc = 0, frames = 0, period_draws = 0, period_disp = 0;
+	std::vector<std::array<uint64_t, 4 * FnCount>> last;
+};
+
+thread_local Period t_period;
+
+const char* const kFnNames[FnCount] = {"backed",   "prefix", "fullmap",  "clamp",    "stillvalid", "mayfault", "cpumod",
+                                       "findback", "rearm",  "wunwatch", "rwatch",   "runwatch",   "otherprot"};
+const char* const kScheduleNames[4] = {"off", "stats", "on", "ab"};
+
+std::mutex g_restore_mutex;
+void (*g_restore)(void*) = nullptr;
+void* g_restore_context  = nullptr;
+
+const char* LeverName(int lever, const char* middle) {
+	return lever == LeverSkip ? "skip" : lever == LeverExact ? "0" : middle;
+}
+
+uint64_t MonoNs() {
+	timespec ts {};
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+
+uint64_t ThreadNs() {
+	timespec ts {};
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+	return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
+
+std::string ThreadName(int tid) {
+	char path[96];
+	std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
+	FILE* file = std::fopen(path, "r");
+	if (file == nullptr) return "?";
+	char comm[64] = {};
+	if (std::fgets(comm, sizeof(comm), file) == nullptr) comm[0] = 0;
+	std::fclose(file);
+	comm[std::strcspn(comm, "\n")] = 0;
+	return comm;
+}
+
+int FindTid(const char* name) {
+#ifndef _WIN32
+	DIR* dir = ::opendir("/proc/self/task");
+	if (dir == nullptr) return 0;
+	int found = 0;
+	while (const dirent* entry = ::readdir(dir)) {
+		const int tid = std::atoi(entry->d_name);
+		if (tid > 0 && ThreadName(tid) == name) {
+			found = tid;
+			break;
+		}
+	}
+	::closedir(dir);
+	return found;
+#else
+	(void)name;
+	return 0;
+#endif
+}
+
+uint64_t TidCpuNs(int tid) {
+	if (tid == 0) return 0;
+	char path[96];
+	std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat", tid);
+	FILE* file = std::fopen(path, "r");
+	if (file == nullptr) return 0;
+	unsigned long long ns = 0;
+	if (std::fscanf(file, "%llu", &ns) != 1) ns = 0;
+	std::fclose(file);
+	return ns;
+}
+
+bool PhaseOn(uint64_t now) {
+	if (now < g_reg_origin_ns + RegCfg().start_s * 1000000000ull) return false;
+	switch (RegCeilMode()) {
+		case 2: return true;
+		case 3: return ((now / 10000000000ull) % 2) == 0;
+		default: return false;
+	}
+}
+
+void PrintCounters(Period& p, bool on, double end) {
+	std::lock_guard lock(g_reg_threads_mutex);
+	p.last.resize(g_reg_threads.size());
+	for (size_t t = 0; t < g_reg_threads.size(); t++) {
+		const auto* c = g_reg_threads[t];
+		auto& last = p.last[t];
+		std::array<uint64_t, 4 * FnCount> now {};
+		for (int f = 0; f < FnCount; f++) {
+			now[f] = c->calls[f];
+			now[FnCount + f] = c->hits[f];
+			now[2 * FnCount + f] = c->valid[f];
+			now[3 * FnCount + f] = c->cycles[f];
+		}
+		bool any = false;
+		for (size_t i = 0; i < now.size(); i++) any = any || now[i] != last[i];
+		if (any) {
+			char line[2048];
+			int pos = std::snprintf(line, sizeof(line), "[reg] counts on=%d end=%.2f thread=%s", on ? 1 : 0, end, ThreadName(c->tid).c_str());
+			for (int f = 0; f < FnCount && pos < static_cast<int>(sizeof(line)) - 160; f++) {
+				pos += std::snprintf(line + pos, sizeof(line) - pos, " %s=%llu/%llu/%llu/%llu", kFnNames[f],
+				                     static_cast<unsigned long long>(now[f] - last[f]),
+				                     static_cast<unsigned long long>(now[FnCount + f] - last[FnCount + f]),
+				                     static_cast<unsigned long long>(now[2 * FnCount + f] - last[2 * FnCount + f]),
+				                     static_cast<unsigned long long>(now[3 * FnCount + f] - last[3 * FnCount + f]));
+			}
+			std::fprintf(stderr, "%s\n", line);
+		}
+		last = now;
+	}
+}
+
+void SwitchPhase(bool on) {
+	g_reg_generation.fetch_add(1, std::memory_order_relaxed);
+	const bool was_on = g_reg_on.exchange(on, std::memory_order_relaxed);
+	if (on || !was_on || !SkipConfigured()) return;
+	std::lock_guard lock(g_restore_mutex);
+	if (g_restore == nullptr) return;
+	const auto start = MonoNs();
+	g_restore(g_restore_context);
+	std::fprintf(stderr, "[reg] rearm restored ms=%.2f\n", static_cast<double>(MonoNs() - start) / 1e6);
+}
+
+}
+
+bool Enabled() noexcept {
+	return RegCeilMode() != 0;
+}
+
+bool Timing() noexcept {
+	return RegCeilMode() == 1;
+}
+
+bool On() noexcept {
+	return RegCfg().query && g_reg_on.load(std::memory_order_relaxed);
+}
+
+int StillValidLever() noexcept {
+	const auto& cfg = RegCfg();
+	if (cfg.schedule == 0) return LeverExact;
+	auto& c = RegC();
+	c.calls[FnStillValid]++;
+	if (cfg.stillvalid == LeverExact || !g_reg_on.load(std::memory_order_relaxed)) return LeverExact;
+	if (cfg.stillvalid == LeverSkip) c.hits[FnStillValid]++;
+	return cfg.stillvalid;
+}
+
+int RearmLever() noexcept {
+	const auto& cfg = RegCfg();
+	if (cfg.rearm == LeverExact || !g_reg_on.load(std::memory_order_relaxed)) return LeverExact;
+	return cfg.rearm;
+}
+
+bool SkipConfigured() noexcept {
+	return RegCfg().rearm == LeverSkip;
+}
+
+uint64_t Begin() noexcept {
+	return __rdtsc();
+}
+
+void End(int fn, uint64_t start) noexcept {
+	RegC().cycles[fn] += __rdtsc() - start;
+}
+
+void Count(int fn) noexcept {
+	if (RegCeilMode() != 0) RegC().calls[fn]++;
+}
+
+void NoteProtect(int fn, uint64_t bytes, bool skipped, uint64_t cycles) noexcept {
+	if (RegCeilMode() == 0) return;
+	auto& c = RegC();
+	c.calls[fn]++;
+	if (skipped) c.hits[fn]++;
+	c.valid[fn] += (bytes + 0xfffu) >> 12u;
+	c.cycles[fn] += cycles;
+}
+
+void NoteFrame() noexcept {
+	if (RegCeilMode() != 0) g_reg_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SetRearmRestore(void (*restore)(void*), void* context) noexcept {
+	std::lock_guard lock(g_restore_mutex);
+	if (restore == nullptr && g_restore_context != context) return;
+	g_restore         = restore;
+	g_restore_context = restore == nullptr ? nullptr : context;
+}
+
+bool MemoLookup(int fn, uint64_t vaddr, uint64_t size, uint64_t& value) noexcept {
+	if (RegCeilMode() < 2 || !g_reg_on.load(std::memory_order_relaxed)) return false;
+	const auto& entry = RegMemoSlot(fn, vaddr, size);
+	if (entry.kind == fn + 1 && entry.vaddr == vaddr && entry.size == size &&
+	    entry.generation == g_reg_generation.load(std::memory_order_relaxed)) {
+		RegC().hits[fn]++;
+		value = entry.result;
+		return true;
+	}
+	return false;
+}
+
+void MemoStore(int fn, uint64_t vaddr, uint64_t size, uint64_t value) noexcept {
+	if (RegCeilMode() < 2 || !g_reg_on.load(std::memory_order_relaxed)) return;
+	RegMemoSlot(fn, vaddr, size) = {vaddr, size, value, 0, 0, g_reg_generation.load(std::memory_order_relaxed), fn + 1};
+}
+
+void EndOp(int kind) noexcept {
+	if (RegCeilMode() == 0) return;
+	auto& s = t_period;
+	if (kind == 1) s.draws++;
+	if (kind == 2) s.disp++;
+	if (kind == 0) return;
+	s.ops++;
+	if (s.ops < s.next_check) return;
+	s.next_check = s.ops + 64;
+	const uint64_t now = MonoNs();
+	if (!s.started) {
+		s.started       = true;
+		g_reg_origin_ns = now;
+		s.execute_tid   = FindTid("kytyGpuExecute");
+		s.record_tid   = FindTid("kytyGpuRecord");
+		s.wall         = now;
+		s.cpu          = ThreadNs();
+		s.exec         = TidCpuNs(s.execute_tid);
+		s.record       = TidCpuNs(s.record_tid);
+		s.tsc          = __rdtsc();
+		s.frames       = g_reg_frames.load(std::memory_order_relaxed);
+		s.period_draws = s.draws;
+		s.period_disp  = s.disp;
+		s.on           = PhaseOn(now);
+		const auto& cfg = RegCfg();
+		std::fprintf(stderr,
+		             "[reg] start schedule=%s query=%d stillvalid=%s rearm=%s start_s=%llu execute_tid=%d record_tid=%d\n",
+		             kScheduleNames[cfg.schedule], cfg.query ? 1 : 0, LeverName(cfg.stillvalid, "memo"),
+		             LeverName(cfg.rearm, "protected"), static_cast<unsigned long long>(cfg.start_s), s.execute_tid,
+		             s.record_tid);
+		PrintCounters(s, s.on, 0.0);
+		SwitchPhase(s.on);
+		return;
+	}
+	const bool want_on = PhaseOn(now);
+	if (want_on == s.on && now - s.wall < 10000000000ull) return;
+	if (s.execute_tid == 0) s.execute_tid = FindTid("kytyGpuExecute");
+	if (s.record_tid == 0) s.record_tid = FindTid("kytyGpuRecord");
+	const uint64_t cpu    = ThreadNs();
+	const uint64_t exec   = TidCpuNs(s.execute_tid);
+	const uint64_t record = TidCpuNs(s.record_tid);
+	const uint64_t tsc    = __rdtsc();
+	const uint64_t frames = g_reg_frames.load(std::memory_order_relaxed);
+	const uint64_t draws  = s.draws - s.period_draws;
+	const uint64_t disp   = s.disp - s.period_disp;
+	const uint64_t wall   = now - s.wall;
+	timespec real {};
+	clock_gettime(CLOCK_REALTIME, &real);
+	const double end = real.tv_sec + real.tv_nsec / 1e9;
+	if (draws > 0 && wall > 0) {
+		const double seconds   = wall / 1e9;
+		const double exec_ns   = s.exec != 0 ? static_cast<double>(exec - s.exec) : 0.0;
+		const double record_ns = s.record != 0 ? static_cast<double>(record - s.record) : 0.0;
+		const double resolve_ns = static_cast<double>(cpu - s.cpu);
+		const double frame_count = static_cast<double>(frames - s.frames);
+		std::fprintf(stderr,
+		             "[reg] period on=%d end=%.2f wall_s=%.2f fps=%.2f frames=%llu draws=%llu disp=%llu dps=%.0f "
+		             "draws_per_frame=%.0f resolve_us_per_draw=%.3f exec_us_per_draw=%.3f record_us_per_draw=%.3f "
+		             "resolve_busy=%.3f exec_busy=%.3f record_busy=%.3f tsc_ghz=%.4f\n",
+		             s.on ? 1 : 0, end, seconds, frame_count / seconds, static_cast<unsigned long long>(frames - s.frames),
+		             static_cast<unsigned long long>(draws), static_cast<unsigned long long>(disp), draws / seconds,
+		             frame_count > 0 ? draws / frame_count : 0.0, resolve_ns / 1e3 / draws, exec_ns / 1e3 / draws,
+		             record_ns / 1e3 / draws, resolve_ns / wall, exec_ns / wall, record_ns / wall,
+		             static_cast<double>(tsc - s.tsc) / wall);
+	}
+	PrintCounters(s, s.on, end);
+	s.wall         = now;
+	s.cpu          = cpu;
+	s.exec         = exec;
+	s.record       = record;
+	s.tsc          = tsc;
+	s.frames       = frames;
+	s.period_draws = s.draws;
+	s.period_disp  = s.disp;
+	s.on           = want_on;
+	SwitchPhase(want_on);
+}
+
+}
 
 }

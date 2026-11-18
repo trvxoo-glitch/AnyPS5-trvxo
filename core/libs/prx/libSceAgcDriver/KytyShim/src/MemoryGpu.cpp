@@ -147,10 +147,23 @@ bool HasGpuWrittenBytes(uint64_t vaddr, uint64_t size) {
 	       GetGpuResources().GetBufferCache().MayBeGpuModified(vaddr, size) && GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
 
-bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
+static bool MayFaultOnGpuReadNow(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return false;
 	auto& buffers = GetGpuResources().GetBufferCache();
 	return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
+}
+
+bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
+	if (RegCeil::Enabled()) {
+		RegCeil::Count(RegCeil::FnMayFault);
+		if (RegCeil::Timing()) {
+			const auto start  = RegCeil::Begin();
+			const bool result = MayFaultOnGpuReadNow(vaddr, size);
+			RegCeil::End(RegCeil::FnMayFault, start);
+			return result;
+		}
+	}
+	return MayFaultOnGpuReadNow(vaddr, size);
 }
 
 bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {

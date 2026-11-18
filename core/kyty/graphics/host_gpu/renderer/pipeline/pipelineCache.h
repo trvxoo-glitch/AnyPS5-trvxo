@@ -66,6 +66,7 @@ public:
 	[[nodiscard]] bool Failed() const { return m_failed; }
 	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
 	[[nodiscard]] bool StillValid() const;
+	[[nodiscard]] bool StillValidNow() const;
 	[[nodiscard]] bool HasDescriptorRefresh() const { return !m_refresh.empty(); }
 	void RefreshDescriptorWords(std::span<ShaderRecompiler::IR::ResourceSnapshot>          resources,
 	                            std::span<const ShaderRecompiler::IR::ResourcePlan* const> plans) const;
