@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -167,21 +168,28 @@ struct GpuOwnerMemo {
 };
 
 static thread_local std::array<GpuOwnerMemo, 64> t_gpu_owner_memo {};
+static thread_local bool                          t_gpu_owner_memo_busy = false;
 
 bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return false;
 	auto& buffers = GetGpuResources().GetBufferCache();
 	const auto page = vaddr / Graphics::TRACKER_PAGE_SIZE;
-	if (!GpuOwnerMemoEnabled() || (vaddr + size - 1) / Graphics::TRACKER_PAGE_SIZE != page) {
+	if (!GpuOwnerMemoEnabled() || t_gpu_owner_memo_busy || (vaddr + size - 1) / Graphics::TRACKER_PAGE_SIZE != page) {
 		return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
 	}
+	t_gpu_owner_memo_busy = true;
+	std::atomic_signal_fence(std::memory_order_seq_cst);
 	const auto stamp = Graphics::RegionManager::GpuDirtyStamp();
 	auto&      memo  = t_gpu_owner_memo[page % t_gpu_owner_memo.size()];
+	bool       owned = false;
 	if (stamp != Graphics::RegionManager::GpuDirtyChanging && memo.page == page && memo.stamp == stamp) {
-		return memo.owned;
+		owned = memo.owned;
+	} else {
+		owned = buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
+		memo  = {.page = page, .stamp = stamp, .owned = owned};
 	}
-	const bool owned = buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
-	memo = {.page = page, .stamp = stamp, .owned = owned};
+	std::atomic_signal_fence(std::memory_order_seq_cst);
+	t_gpu_owner_memo_busy = false;
 	return owned;
 }
 
