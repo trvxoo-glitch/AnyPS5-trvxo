@@ -3,9 +3,12 @@
 #include "MemoryShim.hpp"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <array>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -147,16 +150,45 @@ bool HasGpuWrittenBytes(uint64_t vaddr, uint64_t size) {
 	       GetGpuResources().GetBufferCache().MayBeGpuModified(vaddr, size) && GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
 
+static bool GpuOwnerMemoEnabled() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_GPU_OWNER_MEMO");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+static_assert(Graphics::TRACKER_PAGE_SIZE == 4096);
+
+struct GpuOwnerMemo {
+	uint64_t page  = UINT64_MAX;
+	uint64_t stamp = Graphics::RegionManager::GpuDirtyChanging;
+	bool     owned = false;
+};
+
+static thread_local std::array<GpuOwnerMemo, 64> t_gpu_owner_memo {};
+
 bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return false;
 	auto& buffers = GetGpuResources().GetBufferCache();
-	return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
+	const auto page = vaddr / Graphics::TRACKER_PAGE_SIZE;
+	if (!GpuOwnerMemoEnabled() || (vaddr + size - 1) / Graphics::TRACKER_PAGE_SIZE != page) {
+		return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
+	}
+	const auto stamp = Graphics::RegionManager::GpuDirtyStamp();
+	auto&      memo  = t_gpu_owner_memo[page % t_gpu_owner_memo.size()];
+	if (stamp != Graphics::RegionManager::GpuDirtyChanging && memo.page == page && memo.stamp == stamp) {
+		return memo.owned;
+	}
+	const bool owned = buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
+	memo = {.page = page, .stamp = stamp, .owned = owned};
+	return owned;
 }
 
 bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) || !Graphics::GuestGpu::IsGpuThread()) return false;
 	auto& buffers = GetGpuResources().GetBufferCache();
-	if (!buffers.MayBeGpuModified(vaddr, size) || !buffers.IsRegionGpuModified(vaddr, size) || GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+	if (!MayFaultOnGpuRead(vaddr, size) || GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
 		return false;
 	}
 	if (buffers.HasGpuDirtyBytes(vaddr, size)) return buffers.TryReadMirroredGpuWrites(vaddr, data, size);
@@ -167,8 +199,7 @@ const uint8_t* FindAroundBackingPage(uint64_t vaddr) {
 	constexpr uint64_t PageSize = 4096;
 	const auto page = vaddr & ~(PageSize - 1);
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(page, PageSize) || !Graphics::GuestGpu::IsGpuThread()) return nullptr;
-	auto& buffers = GetGpuResources().GetBufferCache();
-	if (!buffers.MayBeGpuModified(page, PageSize) || !buffers.IsRegionGpuModified(page, PageSize) || GetGpuResources().GetTextureCache().IsRegionGpuModified(page, PageSize)) {
+	if (!MayFaultOnGpuRead(page, PageSize) || GetGpuResources().GetTextureCache().IsRegionGpuModified(page, PageSize)) {
 		return nullptr;
 	}
 	return static_cast<const uint8_t*>(FindBackingPointer(page, PageSize));

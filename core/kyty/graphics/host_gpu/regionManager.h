@@ -125,6 +125,11 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+struct alignas(64) GpuDirtyStampState {
+	std::atomic<uint64_t> writers {0};
+	std::atomic<uint64_t> generation {0};
+};
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -135,6 +140,8 @@ public:
 		}
 		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 	}
+
+	~RegionManager() { s_gpu_dirty_stamp.generation.fetch_add(1); }
 
 	[[nodiscard]] static uint64_t CpuDirtyEpoch() {
 		return s_cpu_dirty_epoch.load(std::memory_order_acquire);
@@ -168,6 +175,15 @@ public:
 		return m_gpu_clean_epoch.load(std::memory_order_acquire);
 	}
 
+	static constexpr uint64_t GpuDirtyChanging = UINT64_MAX;
+
+	[[nodiscard]] static uint64_t GpuDirtyStamp() noexcept {
+		if (s_gpu_dirty_stamp.writers.load() != 0) {
+			return GpuDirtyChanging;
+		}
+		return s_gpu_dirty_stamp.generation.load() & ~(uint64_t {1} << 63u);
+	}
+
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	template <DirtySource source>
@@ -186,6 +202,7 @@ public:
 		}
 		auto&      bits = GetBits<source>();
 		RegionBits changed = enable ? RegionBits(~bits, start, end) : RegionBits(bits, start, end);
+		const GpuDirtyChange gpu_change(source == DirtySource::Gpu && !changed.None());
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
@@ -222,6 +239,7 @@ public:
 		}
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
+			const GpuDirtyChange gpu_change(source == DirtySource::Gpu);
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
 				m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
@@ -350,6 +368,7 @@ public:
 		auto either = m_cpu_dirty;
 		either |= m_gpu_dirty;
 		RegionBits changed(~either, start, end);
+		const GpuDirtyChange gpu_change(!changed.None());
 		for (const auto [first, last]: mask) {
 			m_gpu_dirty.SetRange(first, last);
 		}
@@ -376,6 +395,25 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	class GpuDirtyChange {
+	public:
+		explicit GpuDirtyChange(bool active) noexcept: m_active(active) {
+			if (m_active) {
+				s_gpu_dirty_stamp.writers.fetch_add(1);
+			}
+		}
+		~GpuDirtyChange() {
+			if (m_active) {
+				s_gpu_dirty_stamp.generation.fetch_add(1);
+				s_gpu_dirty_stamp.writers.fetch_sub(1);
+			}
+		}
+		KYTY_CLASS_NO_COPY(GpuDirtyChange);
+
+	private:
+		bool m_active;
+	};
+
 	template <bool track, bool is_read>
 	void UpdateProtection(RegionBits& changed) {
 		if (changed.None()) {
@@ -433,6 +471,7 @@ private:
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 	inline static std::atomic<uint64_t> s_gpu_clean_epoch {0};
+	inline static GpuDirtyStampState s_gpu_dirty_stamp;
 };
 
 }

@@ -1,6 +1,9 @@
 #include "kernel/memory.h"
 
 #include "MemoryShim.hpp"
+#include "graphics/host_gpu/memoryTracker.h"
+#include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
@@ -1006,6 +1009,69 @@ void TestSparseReadsSwappedPage() {
 
 }
 
+void TestGpuDirtyStamp() {
+    using Libs::Graphics::RegionManager;
+    constexpr std::uint64_t TrackerPage = 4096;
+    void* guest = nullptr;
+    Require(sceKernelMapFlexibleMemory(&guest, Page, CpuReadWrite, 0) == 0);
+    const auto base = Address(guest);
+    {
+        Libs::Graphics::PageManager pages;
+        Libs::Graphics::MemoryTracker tracker(pages);
+        const auto none = [](std::uint64_t, std::uint64_t) noexcept {};
+        const auto start = RegionManager::GpuDirtyStamp();
+        Require(start != RegionManager::GpuDirtyChanging);
+        Require(!tracker.IsRegionGpuModified(base, TrackerPage));
+        tracker.UnmarkRegionAsGpuModified(base, TrackerPage);
+        Require(RegionManager::GpuDirtyStamp() == start);
+
+        tracker.ForEachUploadRange(base, TrackerPage, true, none, []() noexcept {});
+        const auto written = RegionManager::GpuDirtyStamp();
+        Require(written != start && written != RegionManager::GpuDirtyChanging);
+        Require(tracker.IsRegionGpuModified(base, TrackerPage));
+        Require(!tracker.IsRegionGpuModified(base + TrackerPage, TrackerPage));
+
+        tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(base, TrackerPage, none);
+        Require(RegionManager::GpuDirtyStamp() == written);
+        tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(base + TrackerPage, TrackerPage, none);
+        Require(RegionManager::GpuDirtyStamp() == written);
+
+        tracker.ForEachUploadRange(base + TrackerPage, TrackerPage, false, none, []() noexcept {});
+        Require(RegionManager::GpuDirtyStamp() == written);
+        tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(base + TrackerPage, TrackerPage, none);
+        const auto second = RegionManager::GpuDirtyStamp();
+        Require(second != written && second != RegionManager::GpuDirtyChanging);
+        Require(tracker.IsRegionGpuModified(base + TrackerPage, TrackerPage));
+
+        std::uint64_t downloaded = 0;
+        tracker.ForEachDownloadRange<true>(base + TrackerPage, TrackerPage,
+                                           [&](std::uint64_t, std::uint64_t bytes) noexcept { downloaded += bytes; });
+        Require(downloaded == TrackerPage);
+        const auto read_back = RegionManager::GpuDirtyStamp();
+        Require(read_back != second && read_back != RegionManager::GpuDirtyChanging);
+        Require(!tracker.IsRegionGpuModified(base + TrackerPage, TrackerPage));
+        tracker.ForEachDownloadRange<true>(base + TrackerPage, TrackerPage, none);
+        Require(RegionManager::GpuDirtyStamp() == read_back);
+
+        tracker.UnmarkRegionAsGpuModified(base, TrackerPage);
+        const auto clean = RegionManager::GpuDirtyStamp();
+        Require(clean != read_back && clean != RegionManager::GpuDirtyChanging);
+        Require(!tracker.IsRegionGpuModified(base, TrackerPage));
+        tracker.UnmarkRegionAsGpuModified(base, TrackerPage);
+        Require(RegionManager::GpuDirtyStamp() == clean);
+
+        tracker.MarkRegionAsCpuModified(base, 2 * TrackerPage);
+        Require(RegionManager::GpuDirtyStamp() == clean);
+        static_cast<volatile std::uint8_t*>(guest)[0] = 1;
+        static_cast<volatile std::uint8_t*>(guest)[TrackerPage] = 1;
+        const auto kept = RegionManager::GpuDirtyStamp();
+        Require(kept == clean);
+    }
+    Require(RegionManager::GpuDirtyStamp() != RegionManager::GpuDirtyChanging);
+    Require(sceKernelMunmap(base, Page) == 0);
+    std::printf("GPU ownership stamp: moves on every GPU-dirty set and clear, never on a no-op or a CPU-side change\n");
+}
+
 int main() {
     setenv("APS5_HEAP_CACHE_MIB", "0", 1);
     Require(Libs::LibKernel::Memory::Shim::ViewEnabled());
@@ -1027,6 +1093,7 @@ int main() {
     TestSparseReadsDirectFile();
     TestSparseReadsSwappedPage();
     TestHostWriteHoldRaised();
+    TestGpuDirtyStamp();
     std::printf("KytyShim memory: all checks passed\n");
     return 0;
 }
